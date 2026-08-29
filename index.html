@@ -1,0 +1,1376 @@
+### Outline
+
+1. **File Section Structure**
+   - **HTML Document Head & CSS Theme**: Embedded CSS defining custom properties (cyber-obsidian dark palette), typography, responsive phone frame container (`390px` mobile viewport on desktop, `100vw/100vh` on mobile), glowing status banners, glassmorphism HUD cards, telemetry panels, and large touch targets.
+   - **Mobile Viewport Structure**: Status bar with satellite lock indicator, dynamic turn-by-turn navigation header, live color-shifting state banner, 60 FPS vector canvas map with road geometry and tunnel portals, floating live IMU/gyro telemetry cards, vehicle uncertainty radius, and bottom trip statistics.
+   - **Interactive Demo Control Dock**: Quick action buttons ("Auto-Play Demo", "Enter Tunnel", "Exit Tunnel", "Step-by-Step Advance", "Reset") and judge inspection layer toggles.
+   - **JavaScript State Machine & Simulation Engine**: Pure vanilla JS implementing a 60 FPS physics renderer, procedural S-curve road and tunnel geometry, dual-path trajectory calculation (Raw IMU quadratic drift vs. AI-EKF map-matched track), smooth trajectory re-fusion, and outage timer.
+
+2. **State Machine States & Transitions**
+   - `STAGE_1_GNSS_LOCKED` *(Stage 1)*: Normal GNSS+IMU baseline tracking; online sensor bias calibration active; accuracy $\pm0.6\,\text{m}$.
+   - `STAGE_2_OUTAGE_DETECTED` *(Stage 2)*: HDOP degradation & tunnel entry geofence trigger; proactive outage warning.
+   - `STAGE_3_DR_ACTIVE` *(Stage 3)*: Satellite drop confirmed; strapdown INS takes over; raw IMU quadratic drift begins.
+   - `STAGE_4_AI_EKF_MOTION` *(Stage 4)*: 15-State Error-State Kalman Filter + IO-VNBD neural residual model active; drift growth dampened.
+   - `STAGE_5_MAP_MATCHING` *(Stage 5)*: Road-graph snapping locks cross-track error to tunnel lane center.
+   - `STAGE_6_GNSS_REACQUIRED` *(Stage 6)*: Tunnel exit; satellite signal reappears; consistency validation window filters multipath noise.
+   - `STAGE_7_FUSION_CORRECTED` *(Stage 7)*: Seamless asymptotic trajectory re-blending without position jumps; feedback mismatch vector logged.
+   - *Transitions*: Cyclic progression via Auto-Play timer, Step Next/Prev buttons, or manual direct-trigger buttons.
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <title>NaviSafe — AI Dead Reckoning Mobile Demo (ISRO SIH #26168)</title>
+  
+  <style>
+    /* ==========================================================================
+       1. CSS THEME TOKENS & RESETS (Aero/Space Dark Navigation System)
+       ========================================================================== */
+    :root {
+      --bg-space: #06090e;
+      --bg-phone: #090d16;
+      --bg-card: rgba(13, 19, 32, 0.82);
+      --bg-card-border: rgba(0, 240, 255, 0.18);
+      --bg-glass: rgba(9, 14, 24, 0.88);
+
+      /* Status Colors mapped directly to 7-stage state machine */
+      --color-gnss-locked: #00ff9d;     /* Stage 1: Emerald */
+      --color-outage-detected: #ffb700; /* Stage 2: Amber */
+      --color-dr-active: #ff3b57;       /* Stage 3: Crimson */
+      --color-ai-ekf: #a855f7;          /* Stage 4: Purple */
+      --color-map-matched: #00f0ff;     /* Stage 5: Cyan */
+      --color-reacquired: #3b82f6;      /* Stage 6: Blue */
+      --color-fused: #10b981;           /* Stage 7: Mint Green */
+
+      --color-text-main: #f8fafc;
+      --color-text-muted: #8e9cb2;
+      --color-text-dim: #475569;
+      --color-raw-drift: #ff3b57;
+
+      --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+      --font-mono: 'SF Mono', Consolas, 'Liberation Mono', Menlo, Courier, monospace;
+
+      --safe-top: env(safe-area-inset-top, 14px);
+      --safe-bottom: env(safe-area-inset-bottom, 16px);
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      user-select: none;
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    body {
+      font-family: var(--font-sans);
+      background-color: var(--bg-space);
+      color: var(--color-text-main);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      overflow-x: hidden;
+      padding: 12px;
+    }
+
+    .mono {
+      font-family: var(--font-mono);
+    }
+
+    /* ==========================================================================
+       2. RESPONSIVE PHONE CONTAINER & BEZEL
+       ========================================================================== */
+    .app-viewport-wrapper {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 14px;
+      width: 100%;
+      max-width: 440px;
+    }
+
+    .phone-frame {
+      width: 100%;
+      height: 780px;
+      max-height: 92vh;
+      background: var(--bg-phone);
+      border-radius: 44px;
+      border: 3px solid #1e293b;
+      box-shadow: 
+        0 0 0 8px #0f172a,
+        0 20px 50px rgba(0, 0, 0, 0.85),
+        0 0 40px rgba(0, 240, 255, 0.12);
+      position: relative;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* Full-screen direct mobile view */
+    @media (max-width: 480px) {
+      body {
+        padding: 0;
+      }
+      .app-viewport-wrapper {
+        max-width: 100vw;
+        gap: 0;
+      }
+      .phone-frame {
+        height: 100vh;
+        max-height: 100vh;
+        border-radius: 0;
+        border: none;
+        box-shadow: none;
+      }
+      .demo-controller-card {
+        border-radius: 16px 16px 0 0 !important;
+        margin-top: -12px;
+        z-index: 2000;
+      }
+    }
+
+    /* Dynamic Island / Top Speaker */
+    .phone-island {
+      position: absolute;
+      top: 10px;
+      left: 50%;
+      transform: translateX(-50%);
+      width: 112px;
+      height: 24px;
+      background: #000000;
+      border-radius: 20px;
+      z-index: 1000;
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      padding: 0 10px;
+      gap: 6px;
+    }
+
+    .island-lens {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      background: #0f1f38;
+      border: 1px solid #1e3a5f;
+    }
+
+    .island-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--color-gnss-locked);
+      box-shadow: 0 0 6px var(--color-gnss-locked);
+      transition: all 0.3s;
+    }
+
+    /* ==========================================================================
+       3. IN-APP HEADER & TURN-BY-TURN HUD
+       ========================================================================== */
+    .phone-status-bar {
+      height: 42px;
+      padding: calc(var(--safe-top) - 4px) 20px 0 20px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 0.7rem;
+      color: var(--color-text-muted);
+      z-index: 900;
+      background: linear-gradient(180deg, rgba(9, 13, 22, 0.95) 70%, transparent 100%);
+    }
+
+    .status-icons {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 0.72rem;
+    }
+
+    .sats-pill {
+      background: rgba(0, 0, 0, 0.5);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      padding: 2px 6px;
+      border-radius: 10px;
+      font-size: 0.65rem;
+      color: var(--color-text-main);
+    }
+
+    /* Turn-By-Turn Navigation Card */
+    .turn-banner {
+      margin: 4px 14px 0 14px;
+      background: var(--bg-glass);
+      border: 1px solid var(--bg-card-border);
+      border-radius: 18px;
+      padding: 10px 14px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      z-index: 800;
+      backdrop-filter: blur(14px);
+      box-shadow: 0 10px 24px rgba(0, 0, 0, 0.4);
+    }
+
+    .turn-icon-box {
+      width: 40px;
+      height: 40px;
+      border-radius: 12px;
+      background: rgba(0, 240, 255, 0.12);
+      border: 1px solid rgba(0, 240, 255, 0.35);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1.3rem;
+      flex-shrink: 0;
+    }
+
+    .turn-text-content {
+      flex: 1;
+      min-width: 0;
+    }
+
+    .turn-dist {
+      font-size: 1.05rem;
+      font-weight: 800;
+      color: #fff;
+      line-height: 1.1;
+    }
+
+    .turn-street {
+      font-size: 0.74rem;
+      color: var(--color-text-muted);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .speed-limit-badge {
+      width: 34px;
+      height: 34px;
+      border-radius: 50%;
+      border: 3px solid var(--color-dr-active);
+      background: #ffffff;
+      color: #000;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      font-weight: 900;
+      font-size: 0.78rem;
+      line-height: 0.9;
+      flex-shrink: 0;
+    }
+    .speed-limit-sub {
+      font-size: 0.38rem;
+      color: #555;
+      font-weight: 800;
+    }
+
+    /* ==========================================================================
+       4. DYNAMIC STATE BANNER (7-STAGE FLOW CONTROLLER)
+       ========================================================================== */
+    .state-banner {
+      margin: 8px 14px 0 14px;
+      padding: 9px 14px;
+      border-radius: 14px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      z-index: 800;
+      transition: all 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+      box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
+      border: 1px solid transparent;
+    }
+
+    .state-banner-left {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .state-pulsar {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      flex-shrink: 0;
+      animation: pulse-ring 1.5s infinite;
+    }
+
+    @keyframes pulse-ring {
+      0% { transform: scale(0.95); opacity: 1; }
+      50% { transform: scale(1.3); opacity: 0.7; }
+      100% { transform: scale(0.95); opacity: 1; }
+    }
+
+    .state-title {
+      font-size: 0.78rem;
+      font-weight: 800;
+      letter-spacing: 0.3px;
+    }
+
+    .state-desc {
+      font-size: 0.65rem;
+      color: rgba(255, 255, 255, 0.75);
+    }
+
+    .state-stage-chip {
+      font-size: 0.62rem;
+      font-weight: 800;
+      padding: 2px 7px;
+      border-radius: 8px;
+      background: rgba(0, 0, 0, 0.35);
+      border: 1px solid rgba(255, 255, 255, 0.15);
+      color: #fff;
+    }
+
+    /* Banner Stage Themes */
+    .state-banner.theme-stage1 {
+      background: rgba(0, 255, 157, 0.15);
+      border-color: var(--color-gnss-locked);
+      color: var(--color-gnss-locked);
+    }
+    .state-banner.theme-stage1 .state-pulsar { background: var(--color-gnss-locked); box-shadow: 0 0 10px var(--color-gnss-locked); }
+
+    .state-banner.theme-stage2 {
+      background: rgba(255, 183, 0, 0.2);
+      border-color: var(--color-outage-detected);
+      color: var(--color-outage-detected);
+    }
+    .state-banner.theme-stage2 .state-pulsar { background: var(--color-outage-detected); box-shadow: 0 0 10px var(--color-outage-detected); }
+
+    .state-banner.theme-stage3 {
+      background: rgba(255, 59, 87, 0.22);
+      border-color: var(--color-dr-active);
+      color: var(--color-dr-active);
+    }
+    .state-banner.theme-stage3 .state-pulsar { background: var(--color-dr-active); box-shadow: 0 0 10px var(--color-dr-active); }
+
+    .state-banner.theme-stage4 {
+      background: rgba(168, 85, 247, 0.22);
+      border-color: var(--color-ai-ekf);
+      color: var(--color-ai-ekf);
+    }
+    .state-banner.theme-stage4 .state-pulsar { background: var(--color-ai-ekf); box-shadow: 0 0 10px var(--color-ai-ekf); }
+
+    .state-banner.theme-stage5 {
+      background: rgba(0, 240, 255, 0.2);
+      border-color: var(--color-map-matched);
+      color: var(--color-map-matched);
+    }
+    .state-banner.theme-stage5 .state-pulsar { background: var(--color-map-matched); box-shadow: 0 0 10px var(--color-map-matched); }
+
+    .state-banner.theme-stage6 {
+      background: rgba(59, 130, 246, 0.22);
+      border-color: var(--color-reacquired);
+      color: var(--color-reacquired);
+    }
+    .state-banner.theme-stage6 .state-pulsar { background: var(--color-reacquired); box-shadow: 0 0 10px var(--color-reacquired); }
+
+    .state-banner.theme-stage7 {
+      background: rgba(16, 185, 129, 0.22);
+      border-color: var(--color-fused);
+      color: var(--color-fused);
+    }
+    .state-banner.theme-stage7 .state-pulsar { background: var(--color-fused); box-shadow: 0 0 10px var(--color-fused); }
+
+    /* ==========================================================================
+       5. MAP CANVAS CONTAINER & ON-SCREEN TELEMETRY OVERLAYS
+       ========================================================================== */
+    .map-container {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      z-index: 1;
+      background: #070b12;
+    }
+
+    #mapCanvas {
+      width: 100%;
+      height: 100%;
+      display: block;
+    }
+
+    /* Floating Gauges on Map */
+    .floating-hud-left {
+      position: absolute;
+      top: 172px;
+      left: 14px;
+      z-index: 800;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      pointer-events: none;
+    }
+
+    .speedo-hud {
+      background: var(--bg-glass);
+      border: 1px solid var(--bg-card-border);
+      border-radius: 16px;
+      padding: 10px 12px;
+      min-width: 90px;
+      text-align: center;
+      backdrop-filter: blur(12px);
+      box-shadow: 0 8px 20px rgba(0, 0, 0, 0.5);
+    }
+
+    .speedo-num {
+      font-size: 2rem;
+      font-weight: 900;
+      line-height: 1;
+      color: #fff;
+    }
+
+    .speedo-unit {
+      font-size: 0.58rem;
+      font-weight: 800;
+      color: var(--color-map-matched);
+      letter-spacing: 0.5px;
+    }
+
+    .heading-tag {
+      font-size: 0.6rem;
+      background: rgba(0, 0, 0, 0.4);
+      padding: 2px 6px;
+      border-radius: 6px;
+      margin-top: 4px;
+      color: var(--color-text-muted);
+    }
+
+    .floating-hud-right {
+      position: absolute;
+      top: 172px;
+      right: 14px;
+      z-index: 800;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      pointer-events: none;
+    }
+
+    .mini-card {
+      background: var(--bg-glass);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: 14px;
+      padding: 8px 10px;
+      width: 125px;
+      backdrop-filter: blur(12px);
+      box-shadow: 0 8px 20px rgba(0, 0, 0, 0.5);
+    }
+
+    .card-label {
+      font-size: 0.56rem;
+      font-weight: 800;
+      color: var(--color-text-muted);
+      letter-spacing: 0.5px;
+      display: block;
+      margin-bottom: 2px;
+    }
+
+    .card-val-row {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+    }
+
+    .card-val {
+      font-size: 0.95rem;
+      font-weight: 800;
+    }
+
+    /* Outage Timer (Only ticks up in DR mode) */
+    .outage-timer-box {
+      border-color: rgba(255, 59, 87, 0.35);
+      transition: opacity 0.3s;
+    }
+
+    .outage-timer-box.inactive {
+      opacity: 0.4;
+    }
+
+    /* Map Legend Overlay */
+    .map-legend-overlay {
+      position: absolute;
+      bottom: 96px;
+      left: 14px;
+      background: rgba(6, 9, 14, 0.85);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: 10px;
+      padding: 6px 10px;
+      z-index: 800;
+      font-size: 0.58rem;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      backdrop-filter: blur(10px);
+      pointer-events: none;
+    }
+
+    .legend-row {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      color: var(--color-text-muted);
+    }
+
+    .legend-line {
+      width: 14px;
+      height: 3px;
+      border-radius: 2px;
+    }
+    .line-gnss { background: var(--color-gnss-locked); }
+    .line-dr { background: var(--color-raw-drift); border-top: 1px dashed #fff; }
+    .line-fused { background: var(--color-map-matched); box-shadow: 0 0 6px var(--color-map-matched); }
+
+    /* ==========================================================================
+       6. MOBILE BOTTOM TELEMETRY DRAWER
+       ========================================================================== */
+    .phone-bottom-drawer {
+      position: absolute;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      background: var(--bg-glass);
+      border-top: 1px solid var(--bg-card-border);
+      border-radius: 24px 24px 0 0;
+      padding: 12px 18px calc(var(--safe-bottom) + 2px) 18px;
+      z-index: 900;
+      backdrop-filter: blur(18px);
+      box-shadow: 0 -10px 30px rgba(0, 0, 0, 0.6);
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .bottom-metrics-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 6px;
+      text-align: center;
+    }
+
+    .bm-col {
+      background: rgba(0, 0, 0, 0.35);
+      padding: 6px 4px;
+      border-radius: 10px;
+      border: 1px solid rgba(255, 255, 255, 0.05);
+    }
+
+    .bm-title {
+      font-size: 0.52rem;
+      font-weight: 700;
+      color: var(--color-text-muted);
+      letter-spacing: 0.4px;
+    }
+
+    .bm-val {
+      font-size: 0.82rem;
+      font-weight: 800;
+      color: #ffffff;
+      margin-top: 2px;
+    }
+
+    /* ==========================================================================
+       7. DEMO CONTROLLER PANEL (OUTSIDE PHONE OR FLOATING DOCK)
+       ========================================================================== */
+    .demo-controller-card {
+      width: 100%;
+      background: var(--bg-card);
+      border: 1px solid var(--bg-card-border);
+      border-radius: 24px;
+      padding: 14px 16px;
+      backdrop-filter: blur(16px);
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+    }
+
+    .controller-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 10px;
+    }
+
+    .controller-title {
+      font-size: 0.8rem;
+      font-weight: 800;
+      letter-spacing: 0.5px;
+      color: var(--color-map-matched);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .controller-step-indicator {
+      font-size: 0.68rem;
+      color: var(--color-text-muted);
+    }
+
+    .primary-btn-row {
+      display: grid;
+      grid-template-columns: 1.2fr 1fr 1fr;
+      gap: 8px;
+      margin-bottom: 8px;
+    }
+
+    .btn-action {
+      background: rgba(255, 255, 255, 0.08);
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      color: #fff;
+      font-size: 0.72rem;
+      font-weight: 700;
+      padding: 9px 8px;
+      border-radius: 10px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 4px;
+      transition: all 0.2s;
+    }
+
+    .btn-action:hover {
+      background: rgba(255, 255, 255, 0.16);
+      transform: translateY(-1px);
+    }
+
+    .btn-action:active {
+      transform: scale(0.96);
+    }
+
+    .btn-action.btn-auto {
+      background: linear-gradient(135deg, #00f0ff, #0099ff);
+      color: #000;
+      border: none;
+      font-weight: 800;
+    }
+    .btn-action.btn-auto:hover {
+      box-shadow: 0 0 12px rgba(0, 240, 255, 0.5);
+    }
+
+    .stage-triggers-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 6px;
+      margin-top: 6px;
+    }
+
+    .btn-trigger {
+      background: rgba(0, 0, 0, 0.3);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      color: var(--color-text-muted);
+      font-size: 0.65rem;
+      font-weight: 700;
+      padding: 7px;
+      border-radius: 8px;
+      cursor: pointer;
+      text-align: left;
+      transition: all 0.2s;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .btn-trigger:hover {
+      border-color: var(--color-map-matched);
+      color: #fff;
+    }
+
+    .btn-trigger.active {
+      background: rgba(0, 240, 255, 0.15);
+      border-color: var(--color-map-matched);
+      color: var(--color-map-matched);
+    }
+  </style>
+</head>
+<body>
+
+  <div class="app-viewport-wrapper">
+    
+    <!-- Phone Hardware Bezel Simulation -->
+    <div class="phone-frame">
+      
+      <!-- Top Speaker & Camera Island -->
+      <div class="phone-island">
+        <div class="island-lens"></div>
+        <div class="island-dot" id="islandDot"></div>
+      </div>
+
+      <!-- Phone Status Bar -->
+      <div class="phone-status-bar">
+        <span class="mono" id="phoneClock">12:42</span>
+        <div class="status-icons">
+          <span class="sats-pill mono" id="hudSats">18 SATS (NavIC+GPS)</span>
+          <span>5G 📶</span>
+          <span>🔋 94%</span>
+        </div>
+      </div>
+
+      <!-- Turn-by-turn Navigation Banner -->
+      <div class="turn-banner">
+        <div class="turn-icon-box" id="turnIcon">⬆️</div>
+        <div class="turn-text-content">
+          <div class="turn-dist" id="turnDist">In 350 m</div>
+          <div class="turn-street" id="turnStreet">Kamshet Expressway Tunnel (Section 1)</div>
+        </div>
+        <div class="speed-limit-badge">
+          <span>80</span>
+          <span class="speed-limit-sub">KM/H</span>
+        </div>
+      </div>
+
+      <!-- Dynamic 7-Stage State Machine Status Banner -->
+      <div class="state-banner theme-stage1" id="stateBanner">
+        <div class="state-banner-left">
+          <div class="state-pulsar"></div>
+          <div>
+            <div class="state-title" id="stateTitle">GNSS LOCKED (HEALTHY)</div>
+            <div class="state-desc" id="stateDesc">Dual-freq NavIC + GPS • Online IMU Auto-Calibration</div>
+          </div>
+        </div>
+        <div class="state-stage-chip mono" id="stateStageChip">STAGE 1/7</div>
+      </div>
+
+      <!-- 60 FPS Tactical Vector Map Canvas -->
+      <div class="map-container">
+        <canvas id="mapCanvas"></canvas>
+      </div>
+
+      <!-- Floating HUD: Speedometer & Heading -->
+      <div class="floating-hud-left">
+        <div class="speedo-hud">
+          <div class="speedo-num mono" id="hudSpeed">78</div>
+          <div class="speedo-unit">KM/H</div>
+          <div class="heading-tag mono" id="hudHeading">042° NE</div>
+        </div>
+      </div>
+
+      <!-- Floating HUD: EKF Error & Outage Timer -->
+      <div class="floating-hud-right">
+        <div class="mini-card">
+          <span class="card-label">ACCURACY RADIUS</span>
+          <div class="card-val-row">
+            <span class="card-val mono" id="hudAccuracy" style="color: var(--color-gnss-locked);">± 0.4 m</span>
+          </div>
+        </div>
+
+        <div class="mini-card outage-timer-box inactive" id="outageTimerCard">
+          <span class="card-label">OUTAGE DURATION</span>
+          <div class="card-val-row">
+            <span class="card-val mono" id="hudOutageTimer" style="color: var(--color-dr-active);">00:00.0</span>
+          </div>
+        </div>
+
+        <div class="mini-card">
+          <span class="card-label">AI RESIDUAL DRIFT</span>
+          <div class="card-val-row">
+            <span class="card-val mono" id="hudAiDamp" style="color: var(--color-map-matched);">-98.4%</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Canvas Map Color Legend -->
+      <div class="map-legend-overlay">
+        <div class="legend-row">
+          <div class="legend-line line-gnss"></div>
+          <span>GNSS Reference Track</span>
+        </div>
+        <div class="legend-row">
+          <div class="legend-line line-dr"></div>
+          <span>Raw IMU Divergence</span>
+        </div>
+        <div class="legend-row">
+          <div class="legend-line line-fused"></div>
+          <span>NaviSafe AI+EKF Track</span>
+        </div>
+      </div>
+
+      <!-- Phone Bottom Telemetry Drawer -->
+      <div class="phone-bottom-drawer">
+        <div class="bottom-metrics-grid">
+          <div class="bm-col">
+            <div class="bm-title">EST. VELOCITY</div>
+            <div class="bm-val mono" id="bmVel">21.6 m/s</div>
+          </div>
+          <div class="bm-col">
+            <div class="bm-title">IMU BIAS (ACC)</div>
+            <div class="bm-val mono" id="bmAccelBias">0.012 mg</div>
+          </div>
+          <div class="bm-col">
+            <div class="bm-title">MAP SNAP</div>
+            <div class="bm-val mono" id="bmMapSnap" style="color: var(--color-map-matched);">LOCKED</div>
+          </div>
+          <div class="bm-col">
+            <div class="bm-title">REACQ DRIFT</div>
+            <div class="bm-val mono" id="bmReacqDrift">0.0 m</div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- Judge / Demo Controller Console -->
+    <div class="demo-controller-card">
+      <div class="controller-header">
+        <span class="controller-title">🕹️ DEMO CONTROLLER</span>
+        <span class="controller-step-indicator mono" id="controllerStepText">STAGE: 1 OF 7</span>
+      </div>
+
+      <div class="primary-btn-row">
+        <button class="btn-action btn-auto" id="btnAutoPlay">▶ Auto Play Demo</button>
+        <button class="btn-action" id="btnPrevStage">⏮ Prev Stage</button>
+        <button class="btn-action" id="btnNextStage">⏭ Next Stage</button>
+      </div>
+
+      <div class="stage-triggers-grid">
+        <button class="btn-trigger active" id="btnTrigStage1" onclick="setDemoStage(0)">1. Normal GNSS Track</button>
+        <button class="btn-trigger" id="btnTrigStage2" onclick="setDemoStage(1)">2. Outage Detected</button>
+        <button class="btn-trigger" id="btnTrigStage3" onclick="setDemoStage(2)">3. Dead Reckoning (DR)</button>
+        <button class="btn-trigger" id="btnTrigStage4" onclick="setDemoStage(3)">4. AI + EKF Correction</button>
+        <button class="btn-trigger" id="btnTrigStage5" onclick="setDemoStage(4)">5. Map-Matching Snap</button>
+        <button class="btn-trigger" id="btnTrigStage6" onclick="setDemoStage(5)">6. GNSS Reacquisition</button>
+        <button class="btn-trigger" id="btnTrigStage7" onclick="setDemoStage(6)" style="grid-column: span 2;">7. Smooth Trajectory Fusion & Reconverge</button>
+      </div>
+    </div>
+
+  </div>
+
+  <script>
+    /**
+     * ==========================================================================
+     * NAVISAFE ON-DEVICE DEAD RECKONING STATE MACHINE & SIMULATOR ENGINE
+     * Smart India Hackathon - Problem Statement #26168 (ISRO)
+     * ==========================================================================
+     */
+
+    // 7-Stage State Machine Definitions matching the required lifecycle flow
+    const STAGES = [
+      {
+        id: 0,
+        name: "STAGE 1: GNSS AVAILABLE (BASELINE TRACKING)",
+        title: "GNSS LOCKED (HEALTHY)",
+        desc: "Dual-freq NavIC + GPS • Online IMU Auto-Calibration Active",
+        theme: "theme-stage1",
+        chip: "STAGE 1/7",
+        islandColor: "var(--color-gnss-locked)",
+        accuracy: "± 0.4 m",
+        accColor: "var(--color-gnss-locked)",
+        sats: "18 SATS (NavIC+GPS)",
+        isOutage: false,
+        mapSnap: "LOCKED",
+        aiDamp: "IDLE",
+        speed: 78,
+        turnText: "In 350 m — Approaching Tunnel",
+        turnIcon: "⬆️"
+      },
+      {
+        id: 1,
+        name: "STAGE 2: GNSS OUTAGE DETECTED",
+        title: "GNSS OUTAGE DETECTED",
+        desc: "HDOP Degrading • Proactive Geofence Trigger Armed",
+        theme: "theme-stage2",
+        chip: "STAGE 2/7",
+        islandColor: "var(--color-outage-detected)",
+        accuracy: "± 1.2 m",
+        accColor: "var(--color-outage-detected)",
+        sats: "04 SATS (DEGRADED)",
+        isOutage: true,
+        mapSnap: "ARMING",
+        aiDamp: "PREP",
+        speed: 74,
+        turnText: "Entering Kamshet Tunnel",
+        turnIcon: "⚠️"
+      },
+      {
+        id: 2,
+        name: "STAGE 3: DEAD RECKONING ACTIVATES",
+        title: "DEAD RECKONING ACTIVE",
+        desc: "Satellite Signal Lost • Strapdown INS Mechanization",
+        theme: "theme-stage3",
+        chip: "STAGE 3/7",
+        islandColor: "var(--color-dr-active)",
+        accuracy: "± 2.8 m",
+        accColor: "var(--color-dr-active)",
+        sats: "00 SATS (NO SIGNAL)",
+        isOutage: true,
+        mapSnap: "INS ONLY",
+        aiDamp: "STARTING",
+        speed: 72,
+        turnText: "Tunnel Center (Inside Outage)",
+        turnIcon: "🚇"
+      },
+      {
+        id: 3,
+        name: "STAGE 4: AI + EKF MOTION ESTIMATION",
+        title: "AI + 15-STATE ES-EKF ON",
+        desc: "IO-VNBD Neural Residuals Dampen Sensor Noise",
+        theme: "theme-stage4",
+        chip: "STAGE 4/7",
+        islandColor: "var(--color-ai-ekf)",
+        accuracy: "± 1.8 m",
+        accColor: "var(--color-ai-ekf)",
+        sats: "00 SATS (NO SIGNAL)",
+        isOutage: true,
+        mapSnap: "EKF ACTIVE",
+        aiDamp: "-94.2%",
+        speed: 70,
+        turnText: "Tunnel Transit (AI Compensated)",
+        turnIcon: "🧬"
+      },
+      {
+        id: 4,
+        name: "STAGE 5: MAP-MATCHING CONSTRAINT",
+        title: "MAP-MATCHED ROAD SNAP",
+        desc: "Cross-Track Divergence Constrained to Lane Center",
+        theme: "theme-stage5",
+        chip: "STAGE 5/7",
+        islandColor: "var(--color-map-matched)",
+        accuracy: "± 0.9 m",
+        accColor: "var(--color-map-matched)",
+        sats: "00 SATS (NO SIGNAL)",
+        isOutage: true,
+        mapSnap: "SNAPPED",
+        aiDamp: "-98.7%",
+        speed: 70,
+        turnText: "120m to Tunnel Exit Portal",
+        turnIcon: "🛣️"
+      },
+      {
+        id: 5,
+        name: "STAGE 6: GNSS REACQUISITION",
+        title: "GNSS REACQUIRED (VALIDATING)",
+        desc: "Debouncing Multipath Reflections at Tunnel Exit",
+        theme: "theme-stage6",
+        chip: "STAGE 6/7",
+        islandColor: "var(--color-reacquired)",
+        accuracy: "± 1.4 m",
+        accColor: "var(--color-reacquired)",
+        sats: "12 SATS (LOCKING)",
+        isOutage: false,
+        mapSnap: "LOCKED",
+        aiDamp: "SETTLING",
+        speed: 75,
+        turnText: "Exited Tunnel — Signal Locked",
+        turnIcon: "🛰️"
+      },
+      {
+        id: 6,
+        name: "STAGE 7: TRAJECTORY FUSION & RECONVERGE",
+        title: "SMOOTH FUSION COMPLETED",
+        desc: "Asymptotic Re-Blend (No Jumps) • Feedback Logged",
+        theme: "theme-stage7",
+        chip: "STAGE 7/7",
+        islandColor: "var(--color-fused)",
+        accuracy: "± 0.4 m",
+        accColor: "var(--color-fused)",
+        sats: "18 SATS (NavIC+GPS)",
+        isOutage: false,
+        mapSnap: "LOCKED",
+        aiDamp: "STABLE",
+        speed: 80,
+        turnText: "Continue on Expressway (Open Sky)",
+        turnIcon: "✅"
+      }
+    ];
+
+    let currentStageIndex = 0;
+    let isAutoPlaying = false;
+    let autoPlayTimer = null;
+    let outageElapsedMs = 0;
+    let lastTimestamp = performance.now();
+
+    // DOM References
+    const canvas = document.getElementById('mapCanvas');
+    const ctx = canvas.getContext('2d');
+    const islandDot = document.getElementById('islandDot');
+    const hudSats = document.getElementById('hudSats');
+    const hudSpeed = document.getElementById('hudSpeed');
+    const hudHeading = document.getElementById('hudHeading');
+    const hudAccuracy = document.getElementById('hudAccuracy');
+    const hudOutageTimer = document.getElementById('hudOutageTimer');
+    const outageTimerCard = document.getElementById('outageTimerCard');
+    const hudAiDamp = document.getElementById('hudAiDamp');
+    const stateBanner = document.getElementById('stateBanner');
+    const stateTitle = document.getElementById('stateTitle');
+    const stateDesc = document.getElementById('stateDesc');
+    const stateStageChip = document.getElementById('stateStageChip');
+    const turnDist = document.getElementById('turnDist');
+    const turnStreet = document.getElementById('turnStreet');
+    const turnIcon = document.getElementById('turnIcon');
+    const bmVel = document.getElementById('bmVel');
+    const bmAccelBias = document.getElementById('bmAccelBias');
+    const bmMapSnap = document.getElementById('bmMapSnap');
+    const bmReacqDrift = document.getElementById('bmReacqDrift');
+    const btnAutoPlay = document.getElementById('btnAutoPlay');
+    const controllerStepText = document.getElementById('controllerStepText');
+
+    // Canvas Road Geometry Points (S-Curve Highway with Tunnel Section)
+    let roadPoints = [];
+    let carT = 0.08; // Normalized vehicle progress along road (0.0 to 1.0)
+    let rawDriftT = 0.08;
+
+    function resizeCanvas() {
+      const rect = canvas.parentElement.getBoundingClientRect();
+      canvas.width = rect.width * window.devicePixelRatio;
+      canvas.height = rect.height * window.devicePixelRatio;
+      ctx.scale(window.devicePixelRatio, window.devicePixelRatio);
+      generateRoadPath(rect.width, rect.height);
+    }
+
+    function generateRoadPath(w, h) {
+      roadPoints = [];
+      const steps = 100;
+      for (let i = 0; i <= steps; i++) {
+        const t = i / steps;
+        // S-curve parametric road
+        const x = w * 0.5 + Math.sin(t * Math.PI * 2.2) * (w * 0.28);
+        const y = h * 0.88 - t * (h * 0.76);
+        roadPoints.push({ x, y, t });
+      }
+    }
+
+    function getRoadPointAt(t) {
+      if (roadPoints.length === 0) return { x: 195, y: 400, heading: 0 };
+      const clampedT = Math.max(0, Math.min(1, t));
+      const exactIndex = clampedT * (roadPoints.length - 1);
+      const idx = Math.floor(exactIndex);
+      const frac = exactIndex - idx;
+      const p1 = roadPoints[idx];
+      const p2 = roadPoints[Math.min(roadPoints.length - 1, idx + 1)];
+
+      const x = p1.x + (p2.x - p1.x) * frac;
+      const y = p1.y + (p2.y - p1.y) * frac;
+      const heading = Math.atan2(p2.x - p1.x, -(p2.y - p1.y)); // Radians from North
+
+      return { x, y, heading };
+    }
+
+    // ==========================================================================
+    // STATE MACHINE TRANSITION LOGIC
+    // ==========================================================================
+
+    function setDemoStage(index) {
+      currentStageIndex = (index + STAGES.length) % STAGES.length;
+      const stage = STAGES[currentStageIndex];
+
+      // Update UI Banner & Styles
+      stateBanner.className = `state-banner ${stage.theme}`;
+      stateTitle.textContent = stage.title;
+      stateDesc.textContent = stage.desc;
+      stateStageChip.textContent = stage.chip;
+      islandDot.style.background = stage.islandColor;
+      islandDot.style.boxShadow = `0 0 8px ${stage.islandColor}`;
+
+      // Update HUD Numbers
+      hudAccuracy.textContent = stage.accuracy;
+      hudAccuracy.style.color = stage.accColor;
+      hudSats.textContent = stage.sats;
+      hudSpeed.textContent = stage.speed;
+      bmMapSnap.textContent = stage.mapSnap;
+      hudAiDamp.textContent = stage.aiDamp;
+      turnDist.textContent = stage.turnText;
+      turnIcon.textContent = stage.turnIcon;
+
+      // Outage Timer UI Active toggle
+      if (stage.isOutage) {
+        outageTimerCard.classList.remove('inactive');
+      } else {
+        outageTimerCard.classList.add('inactive');
+        if (currentStageIndex === 0) outageElapsedMs = 0;
+      }
+
+      // Sync Trigger buttons active states
+      for (let i = 0; i < 7; i++) {
+        const btn = document.getElementById(`btnTrigStage${i + 1}`);
+        if (btn) btn.classList.toggle('active', i === currentStageIndex);
+      }
+
+      controllerStepText.textContent = `STAGE: ${currentStageIndex + 1} OF 7`;
+
+      // Set target car position along the road based on scenario progression
+      const targetTByStage = [0.10, 0.28, 0.42, 0.58, 0.72, 0.85, 0.94];
+      carT = targetTByStage[currentStageIndex];
+    }
+
+    function stepNextStage() {
+      setDemoStage(currentStageIndex + 1);
+    }
+
+    function stepPrevStage() {
+      setDemoStage(currentStageIndex - 1);
+    }
+
+    function toggleAutoPlay() {
+      isAutoPlaying = !isAutoPlaying;
+      if (isAutoPlaying) {
+        btnAutoPlay.textContent = "⏸ Pause Demo";
+        btnAutoPlay.style.background = "linear-gradient(135deg, #ff3b57, #b91c1c)";
+        runAutoPlayLoop();
+      } else {
+        btnAutoPlay.textContent = "▶ Auto Play Demo";
+        btnAutoPlay.style.background = "linear-gradient(135deg, #00f0ff, #0099ff)";
+        clearTimeout(autoPlayTimer);
+      }
+    }
+
+    function runAutoPlayLoop() {
+      if (!isAutoPlaying) return;
+      autoPlayTimer = setTimeout(() => {
+        stepNextStage();
+        runAutoPlayLoop();
+      }, 4200); // 4.2 seconds per stage transition
+    }
+
+    // ==========================================================================
+    // 60 FPS VECTOR MAP RENDERING ENGINE
+    // ==========================================================================
+
+    function renderMap(now) {
+      const dt = (now - lastTimestamp) / 1000;
+      lastTimestamp = now;
+
+      // Update Outage duration timer during dead reckoning stages
+      const stage = STAGES[currentStageIndex];
+      if (stage.isOutage) {
+        outageElapsedMs += dt * 1000;
+        const totalSecs = (outageElapsedMs / 1000).toFixed(1);
+        const mins = Math.floor(totalSecs / 60).toString().padStart(2, '0');
+        const secs = (totalSecs % 60).toFixed(1).padStart(4, '0');
+        hudOutageTimer.textContent = `${mins}:${secs}`;
+      }
+
+      const w = canvas.width / window.devicePixelRatio;
+      const h = canvas.height / window.devicePixelRatio;
+
+      ctx.clearRect(0, 0, w, h);
+
+      // 1. Draw Tactical Dark Grid & Terrain Contours
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.04)';
+      ctx.lineWidth = 1;
+      const gridSize = 40;
+      for (let x = 0; x < w; x += gridSize) {
+        ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke();
+      }
+      for (let y = 0; y < h; y += gridSize) {
+        ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+      }
+
+      // 2. Identify Tunnel Section (t from 0.28 to 0.82)
+      const tunnelStartIdx = Math.floor(roadPoints.length * 0.28);
+      const tunnelEndIdx = Math.floor(roadPoints.length * 0.82);
+
+      // 3. Draw Tunnel Outage Zone Shadow / Portal
+      if (roadPoints.length > 0) {
+        const pStart = roadPoints[tunnelStartIdx];
+        const pEnd = roadPoints[tunnelEndIdx];
+
+        // Shaded Outage Polygon
+        ctx.fillStyle = 'rgba(255, 59, 87, 0.06)';
+        ctx.beginPath();
+        ctx.arc(pStart.x, pStart.y, 45, 0, Math.PI * 2);
+        ctx.fill();
+
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.65)';
+        ctx.strokeStyle = 'rgba(255, 59, 87, 0.35)';
+        ctx.lineWidth = 2;
+        ctx.setLineDash([4, 4]);
+
+        // Draw Tunnel Cylinder Hull
+        ctx.beginPath();
+        for (let i = tunnelStartIdx; i <= tunnelEndIdx; i++) {
+          const pt = roadPoints[i];
+          if (i === tunnelStartIdx) ctx.moveTo(pt.x - 22, pt.y);
+          else ctx.lineTo(pt.x - 22, pt.y);
+        }
+        for (let i = tunnelEndIdx; i >= tunnelStartIdx; i--) {
+          const pt = roadPoints[i];
+          ctx.lineTo(pt.x + 22, pt.y);
+        }
+        ctx.closePath();
+        ctx.fill();
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        // Tunnel Portal Entry / Exit Badges
+        ctx.fillStyle = 'rgba(255, 183, 0, 0.8)';
+        ctx.font = '9px monospace';
+        ctx.fillText('⚡ TUNNEL PORTAL IN (GPS DROP)', pStart.x - 70, pStart.y + 16);
+        ctx.fillStyle = 'rgba(59, 130, 246, 0.8)';
+        ctx.fillText('🛰️ TUNNEL PORTAL OUT (REACQ)', pEnd.x - 70, pEnd.y - 12);
+      }
+
+      // 4. Draw Road Base & Asphalt
+      ctx.strokeStyle = '#151f30';
+      ctx.lineWidth = 36;
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      ctx.beginPath();
+      roadPoints.forEach((pt, idx) => {
+        if (idx === 0) ctx.moveTo(pt.x, pt.y);
+        else ctx.lineTo(pt.x, pt.y);
+      });
+      ctx.stroke();
+
+      // Road Inner Lane Borders
+      ctx.strokeStyle = '#1e2d44';
+      ctx.lineWidth = 32;
+      ctx.stroke();
+
+      // Center Dashed White/Yellow Line
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.35)';
+      ctx.lineWidth = 2;
+      ctx.setLineDash([8, 8]);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      // 5. Draw Trajectory Comparison Trails
+      // A. Ground Truth / Fused Track (Cyan/Green Glow)
+      ctx.strokeStyle = '#00f0ff';
+      ctx.lineWidth = 4;
+      ctx.shadowColor = '#00f0ff';
+      ctx.shadowBlur = 8;
+      ctx.beginPath();
+      const maxDrawIdx = Math.floor(carT * roadPoints.length);
+      for (let i = 0; i <= maxDrawIdx; i++) {
+        const pt = roadPoints[i];
+        if (i === 0) ctx.moveTo(pt.x, pt.y);
+        else ctx.lineTo(pt.x, pt.y);
+      }
+      ctx.stroke();
+      ctx.shadowBlur = 0;
+
+      // B. Draw Raw IMU Uncorrected Drift Divergence during Outage (Stages 3 to 6)
+      if (currentStageIndex >= 2 && currentStageIndex <= 6) {
+        ctx.strokeStyle = '#ff3b57';
+        ctx.lineWidth = 2.5;
+        ctx.setLineDash([4, 4]);
+        ctx.shadowColor = '#ff3b57';
+        ctx.shadowBlur = 6;
+
+        ctx.beginPath();
+        for (let i = tunnelStartIdx; i <= maxDrawIdx; i++) {
+          const pt = roadPoints[i];
+          const progressInTunnel = (i - tunnelStartIdx) / (tunnelEndIdx - tunnelStartIdx);
+          // Quadratic lateral drift simulation d = 0.5 * bias * t^2
+          const driftMagnitude = Math.pow(progressInTunnel, 1.8) * 38;
+          const driftX = pt.x + driftMagnitude;
+          const driftY = pt.y - driftMagnitude * 0.2;
+
+          if (i === tunnelStartIdx) ctx.moveTo(pt.x, pt.y);
+          else ctx.lineTo(driftX, driftY);
+        }
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.shadowBlur = 0;
+
+        // Raw IMU drifted ghost car position
+        const currentPt = getRoadPointAt(carT);
+        const tunnelProgress = Math.max(0, (carT - 0.28) / (0.82 - 0.28));
+        const currentDrift = Math.pow(tunnelProgress, 1.8) * 38;
+        const ghostX = currentPt.x + currentDrift;
+        const ghostY = currentPt.y - currentDrift * 0.2;
+
+        ctx.fillStyle = 'rgba(255, 59, 87, 0.4)';
+        ctx.strokeStyle = '#ff3b57';
+        ctx.beginPath();
+        ctx.arc(ghostX, ghostY, 6, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+
+        ctx.fillStyle = '#ff3b57';
+        ctx.font = '8px monospace';
+        ctx.fillText(`RAW IMU DRIFT (+${(currentDrift * 4.8).toFixed(1)}m)`, ghostX + 10, ghostY + 3);
+
+        // Update Bottom Reacquisition Drift metric
+        bmReacqDrift.textContent = `+${(currentDrift * 0.12).toFixed(1)} m`;
+      } else {
+        bmReacqDrift.textContent = "0.0 m";
+      }
+
+      // 6. Draw Vehicle Position & Dynamic Uncertainty Ellipse
+      const carPos = getRoadPointAt(carT);
+      const headingDeg = Math.round(((carPos.heading * 180 / Math.PI) + 360) % 360);
+      hudHeading.textContent = `${headingDeg.toString().padStart(3, '0')}° NE`;
+
+      // Draw Kalman Uncertainty Covariance Circle around vehicle
+      const uncertaintyRadius = currentStageIndex === 0 || currentStageIndex === 6 ? 12 : 
+                                currentStageIndex === 1 || currentStageIndex === 5 ? 20 : 34;
+
+      ctx.strokeStyle = stage.accColor;
+      ctx.fillStyle = stage.accColor.replace('rgb', 'rgba').replace(')', ', 0.15)');
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.arc(carPos.x, carPos.y, uncertaintyRadius, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+
+      // Vehicle Directional Arrow / Wedge Marker
+      ctx.save();
+      ctx.translate(carPos.x, carPos.y);
+      ctx.rotate(carPos.heading);
+
+      // Headlight Beams
+      const beamGrad = ctx.createLinearGradient(0, -8, 0, -45);
+      beamGrad.addColorStop(0, 'rgba(0, 240, 255, 0.4)');
+      beamGrad.addColorStop(1, 'rgba(0, 240, 255, 0)');
+      ctx.fillStyle = beamGrad;
+      ctx.beginPath();
+      ctx.moveTo(-6, -6);
+      ctx.lineTo(-18, -45);
+      ctx.lineTo(18, -45);
+      ctx.lineTo(6, -6);
+      ctx.closePath();
+      ctx.fill();
+
+      // Vehicle Body Shell
+      ctx.fillStyle = '#ffffff';
+      ctx.shadowColor = '#00f0ff';
+      ctx.shadowBlur = 12;
+      ctx.beginPath();
+      ctx.moveTo(0, -10);
+      ctx.lineTo(7, 8);
+      ctx.lineTo(0, 4);
+      ctx.lineTo(-7, 8);
+      ctx.closePath();
+      ctx.fill();
+      ctx.shadowBlur = 0;
+
+      ctx.restore();
+
+      // Request next animation frame
+      requestAnimationFrame(renderMap);
+    }
+
+    // ==========================================================================
+    // INITIALIZATION & EVENT LISTENERS
+    // ==========================================================================
+
+    window.addEventListener('DOMContentLoaded', () => {
+      resizeCanvas();
+      window.addEventListener('resize', resizeCanvas);
+
+      // Initial Stage 1
+      setDemoStage(0);
+
+      // Start animation loop
+      requestAnimationFrame(renderMap);
+
+      // Bind controller buttons
+      btnAutoPlay.addEventListener('click', toggleAutoPlay);
+      document.getElementById('btnNextStage').addEventListener('click', stepNextStage);
+      document.getElementById('btnPrevStage').addEventListener('click', stepPrevStage);
+
+      // Live Phone Clock update
+      setInterval(() => {
+        const now = new Date();
+        document.getElementById('phoneClock').textContent = 
+          `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`;
+      }, 1000);
+    });
+  </script>
+</body>
+</html>
+```
