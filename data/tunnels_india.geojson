@@ -1,0 +1,39 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "id": "fixture-atal-tunnel",
+        "name": "Atal Tunnel",
+        "length_meters": 9020
+      },
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [
+          [77.1906, 32.3276],
+          [77.1865, 32.3480],
+          [77.1800, 32.3720],
+          [77.1720, 32.3900],
+          [77.1654, 32.4045]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "id": "fixture-chenani-nashri",
+        "name": "Chenani-Nashri Tunnel",
+        "length_meters": 9280
+      },
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [
+          [75.2917, 33.0453],
+          [75.29, 33.08],
+          [75.2758, 33.1251]
+        ]
+      }
+    }
+  ]
+}
